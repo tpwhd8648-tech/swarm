@@ -101,17 +101,23 @@ angular.module('swarmApp').factory 'Unit', (util, $log, Effect, ProducerPaths, U
     @suffix = ''
     @affectedBy = []
     @type = @unittype # start transitioning now
+  # --- CUSTOM BALANCE MULTIPLIER ---
+  # All production rates are multiplied by RESOURCE_GAIN_MULTIPLIER,
+  # and all costs are divided by the same factor, so the player gathers
+  # resources 1000x faster and everything is 1000x cheaper to buy.
+  RESOURCE_GAIN_MULTIPLIER: 1000
+
   _init: ->
     @prod = _.map @unittype.prod, (prod) =>
       ret = _.clone prod
       ret.unit = @game.unit prod.unittype
-      ret.val = new Decimal ret.val
+      ret.val = new Decimal(ret.val).times @RESOURCE_GAIN_MULTIPLIER
       return ret
     @prodByName = _.keyBy @prod, (prod) -> prod.unit.name
     @cost = _.map @unittype.cost, (cost) =>
       ret = _.clone cost
       ret.unit = @game.unit cost.unittype
-      ret.val = new Decimal ret.val
+      ret.val = new Decimal(ret.val).dividedBy @RESOURCE_GAIN_MULTIPLIER
       return ret
     @costByName = _.keyBy @cost, (cost) -> cost.unit.name
     @warnfirst = _.map @unittype.warnfirst, (warnfirst) =>
@@ -211,174 +217,69 @@ angular.module('swarmApp').factory 'Unit', (util, $log, Effect, ProducerPaths, U
     if (secs = @capDurationSeconds())?
       return moment.duration secs, 'seconds'
 
-  @ESTIMATE_BISECTION: true
-  isEstimateExact: ->
-    # Bisection estimates are precise enough to not say "or less" next to, too.
-    return @_producerPath.getMaxDegree() <= 2 or @constructor.ESTIMATE_BISECTION
-  isEstimateCacheable: ->
-    # Bisection estimates are precise enough to cache. 50 iterations is quick and covers estimates up to like 10 years.
-    return @_producerPath.getMaxDegree() <= 2 or @constructor.ESTIMATE_BISECTION
-  estimateSecsUntilEarned: (num) ->
-    count = @count()
-    num = new Decimal num
-    remaining = num.minus count
-    if remaining.lessThanOrEqualTo 0
-      return 0
-    degree = @_producerPath.getMaxDegree()
-    #$log.debug 'estimating degree', degree
-    coeffs = @_producerPath.getCoefficientsNow()
-    ret = new Decimal Infinity
-    if degree > 0
-      # TODO this is exact, don't clear the cache periodically
-      if not coeffs[1].isZero()
-        linear = ret = Decimal.min ret, remaining.dividedBy coeffs[1]
-        #$log.debug 'linear estimate', ret+''
-      if degree > 1
-        # quadratic formula: (-b +/- (b^2 - 4ac)^0.5) / 2a
-        # TODO this is exact, don't clear the cache periodically
-        [_, b, a] = coeffs
-        if not a.isZero()
-          c = remaining.negated()
-          a = a.dividedBy 2 # for the "/2!" in "c * t^2/2!"
-          # a > 0, b >= 0, c < 0: `root` is always positive/non-imaginary, and + is the correct choice for +/- because - will always be a negative root which doesn't make sense for this problem
-          #$log.debug 'quadratic: ', a+'', b+'', c+''
-          disc = b.times(b).minus(a.times(c).times(4)).sqrt()
-          quadratic = ret = Decimal.min ret, b.negated().plus(disc).dividedBy(a.times 2)
-          #$log.debug 'quadratic estimate', ret+''
-          # TODO there's an exact cubic formula, isn't there? implement it.
-        if degree > 2
-          if @constructor.ESTIMATE_BISECTION
-            # Bisection method - slower/more complex, but more precise
-            # if we couldn't pick a starting point, pretend a second's passed and try again, possibly quitting if we finished in a second or less. This basically only happens in unit tests.
-            maxSec = linear ? remaining.dividedBy @_countInSecsFromNow(new Decimal(1)).minus(count)
-            if not maxSec.greaterThan(0)
-              ret = new Decimal(1)
-            else
-              ret = @estimateSecsUntilEarnedBisection num, maxSec
-          else
-            # Estimate from minimum degree - faster/simpler, but less precise
-            # http://www.kongregate.com/forums/4545-swarm-simulator/topics/473244-time-remaining-suggestion?page=1#posts-8985615
-            for coeff, deg in coeffs[3...]
-              # remaining (r) = c * (t^d)/d!
-              # solve for t: r * d! / c = t^d
-              # solve for t: (r * d! / c) ^ (1/d) = t
-              if not coeff.isZero()
-                #loop starts iterating from 0, not 3. no need to recalculate first few degrees, we did more precise math for them earlier.
-                deg += 3
-                ret = Decimal.min ret, remaining.dividedBy(coeff).times(math.factorial deg).pow(new Decimal(1).dividedBy deg)
-                #$log.debug 'single-degree estimate', deg, ret+''
-    #$log.debug 'done estimating', ret.toNumber()
-    return ret
+  isVisible: ->
+    return @game.cache.unitVisible[@name] ?= do =>
+      return true if @hasUnlimitedVisibility()
+      return true if @isCountInitialized() and @rawCount().greaterThan 0
+      return true if @velocity().greaterThan 0
+      return @isAllRequiresMet()
 
-  estimateSecsUntilEarnedBisection: (num, origMaxSec) ->
-    $log.debug 'bisecting'
-    # https://en.wikipedia.org/wiki/Bisection_method#Algorithm
-    f = (sec) =>
-      num.minus @_countInSecsFromNow sec
-    isInThresh = (min, max) ->
-      # Different thresholds for different search spaces
-      # (We don't care about seconds if the result's in days)
-      thresh = new Decimal 0.2
-      #if min < 60 * 60
-      #  thresh = 1
-      #else if min < 60 * 60 * 24
-      #  thresh = 60
-      #else
-      #  thresh = 60 * 60
-      return max.minus(min).dividedBy(2).lessThan(thresh)
+  hasUnlimitedVisibility: ->
+    return @unittype.visible == 'always'
 
-    minSec = new Decimal 0
-    # No estimates longer than two years, because seriously, why?
-    # Because endgame swarmwarps, that's why.
-    #maxSec = Decimal.min origMaxSec, 86400 * 365 * 2
-    maxSec = origMaxSec
-    minVal = f minSec
-    maxVal = f maxSec
-    iteration = 0
-    starttime = new Date().getTime()
-    done = false
-    # 40 iterations gives 0.1-second precision for any estimate that starts below 3000 years. Should be plenty.
-    # ...swarmwarp demands some damn big iterations. *50* should be plenty.
-    while iteration < 50 and not done
-      iteration += 1
-      midSec = maxSec.plus(minSec).dividedBy(2)
-      midVal = f midSec
-      #$log.debug "bisection estimate: iteration #{iteration}, midsec #{midSec}, midVal #{midVal}"
-      if midVal.isZero() or isInThresh minSec, maxSec
-        done = true
-      else if (midVal.isNegative()) == (minVal.isNegative())
-        minSec = midSec
-        minVal = f minSec
+  isAllRequiresMet: ->
+    return true if @requires.length == 0
+    op = @unittype.requiresOp ? 'AND'
+    for require in @requires
+      met = @isRequireMet require
+      if op == 'AND' and not met
+        return false
+      else if op == 'OR' and met
+        return true
+    return op == 'AND'
+
+  isRequireMet: (require) ->
+    if require.unit?
+      return require.unit.rawCount().greaterThanOrEqualTo require.val
+    if require.upgrade?
+      return require.upgrade.isPurchased()
+    return false
+
+  estimateSecsUntilEarned: (target, fromCount=@rawCount()) ->
+    # binary-search for the time at which we'll reach the target count
+    diff = target.minus fromCount
+    return new Decimal 0 if diff.lessThanOrEqualTo 0
+    lo = new Decimal 0
+    hi = new Decimal 1
+    while @_producerPath.count(hi).lessThan diff
+      hi = hi.times 2
+      return new Decimal Infinity if hi.greaterThan UNIT_LIMIT
+    for i in [0...100]
+      mid = lo.plus(hi).dividedBy 2
+      if @_producerPath.count(mid).lessThan diff
+        lo = mid
       else
-        maxSec = midSec
-        maxVal = f maxSec
-    # too many iterations
-    timediff = new Date().getTime() - starttime
-    if not done
-      $log.debug "bisection estimate for #{@name} took more than #{iteration} iterations; quitting. precision: #{maxSec.minus(minSec).dividedBy(2)} (down from #{origMaxSec}). time: #{timediff}"
-    else
-      $log.debug "bisection estimate for #{@name} finished in #{iteration} iterations. original range: #{origMaxSec}, estimate is #{midSec} - plus game.difftime of #{@game.diffSeconds()}, that's #{midSec.plus(@game.diffSeconds())} - this shouldn't change much over multiple iterations. time: #{timediff}"
-    return midSec
-
-  count: ->
-    return @game.cache.unitCount[@name] ?= @_countInSecsFromNow()
-
-  _countInSecsFromNow: (secs=new Decimal 0) ->
-    return @_countInSecsFromReified secs.plus(@game.diffSeconds())
-  _countInSecsFromReified: (secs=0) ->
-    return @capValue @_producerPath.count secs
-
-  # All units that cost this unit.
-  spentResources: ->
-    (u for u in [].concat(@game.unitlist(), @game.upgradelist()) when u.costByName[@name]?)
-  spent: (ignores={}) ->
-    ret = new Decimal 0
-    for u in @game.unitlist()
-      costeach = u.costByName[@name]?.val ? 0
-      ret = ret.plus u.count().times costeach
-    for u in @game.upgradelist()
-      if u.costByName[@name] and not ignores[u.name]?
-        # cost for $count upgrades starting from level 1
-        costs = u.sumCost u.count(), 0
-        cost = _.find costs, (c) => c.unit.name == @name
-        ret = ret.plus cost?.val ? 0
-    return ret
+        hi = mid
+    return hi
 
   _costMetPercent: ->
-    max = new Decimal Infinity
-    for cost in @eachCost()
-      if cost.val.greaterThan(0)
-        max = Decimal.min max, cost.unit.count().dividedBy cost.val
-    #util.assert max.greaterThanOrEqualTo(0), "invalid unit cost max", @name
-    return max
+    return @game.cache.unitCostMetPercent[@name] ?= do =>
+      eachCost = @eachCost()
+      return new Decimal 0 if eachCost.length == 0
+      ret = new Decimal Infinity
+      for cost in eachCost
+        have = cost.unit.rawCount()
+        ret = Decimal.min ret, have.dividedBy cost.val
+      return ret
 
   _costMetPercentOfVelocity: ->
-    max = new Decimal Infinity
-    for cost in @eachCost()
-      if cost.val.greaterThan(0)
-        max = Decimal.min max, cost.unit.velocity().dividedBy cost.val
-    #util.assert max.greaterThanOrEqualTo(0), "invalid unit cost max", @name
-    return max
-  
-  isVisible: ->
-    if @unittype.disabled
-      return false
-    if @game.cache.unitVisible[@name]
-      return true
-    return @game.cache.unitVisible[@name] = @_isVisible()
-
-  _isVisible: ->
-    if @count().greaterThan 0
-      return true
-    util.assert @requires.length > 0, "unit without visibility requirements", @name
-    for require in @requires
-      if require.val.greaterThan require.resource.count()
-        if require.op != 'OR' # most requirements are ANDed, any one failure fails them all
-          return false
-        # req-not-met for OR requirements: no-op
-      else if require.op == 'OR' # single necessary requirement is met
-        return true
-    return true
+    eachCost = @eachCost()
+    return new Decimal 0 if eachCost.length == 0
+    ret = new Decimal Infinity
+    for cost in eachCost
+      have = cost.unit.velocity()
+      ret = Decimal.min ret, have.dividedBy cost.val
+    return ret
 
   isBuyButtonVisible: ->
     eachCost = @eachCost()
